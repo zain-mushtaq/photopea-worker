@@ -9,5 +9,8 @@
     "express": "^4.19.2",
     "googleapis": "^134.0.0",
     "puppeteer-core": "^22.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
