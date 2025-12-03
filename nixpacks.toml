@@ -1,5 +1,5 @@
 [phases.setup]
-nixPkgs = ["...", "chromium", "nss", "freetype", "fontconfig"]
+nixPkgs = ["chromium", "nss", "freetype", "fontconfig"]
 
 [phases.build]
 cmds = ["npm install"]
