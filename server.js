@@ -1,5 +1,5 @@
 const express = require('express');
-const puppeteer = require('puppeteer-core'); // Changed back to Core
+const puppeteer = require('puppeteer-core');
 const { google } = require('googleapis');
 const stream = require('stream');
 const app = express();
@@ -19,35 +19,46 @@ const drive = google.drive({ version: 'v3', auth });
 
 let browser;
 
-// 2. Initialize Browser (The Docker Fix)
+// 2. Initialize Browser
 async function initBrowser() {
     if (browser && browser.isConnected()) return browser;
 
-    console.log("Launching Official Docker Browser...");
+    console.log("Launching Browser from ENV path...");
     
+    // CRITICAL FIX: Use the path provided by the Docker image
+    // If local, fallback to a standard linux path
+    const execPath = process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome-stable';
+
     browser = await puppeteer.launch({
-        // 'google-chrome-stable' is available globally in this Docker image
-        executablePath: 'google-chrome-stable', 
+        executablePath: execPath,
         headless: "new",
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
-            '--single-process'
+            '--single-process',
+            '--no-zygote'
         ]
     });
     
-    console.log("Browser Launched!");
+    console.log(`Browser Launched! (Path: ${execPath})`);
     return browser;
 }
 
 // 3. Health Check
 app.get('/health', async (req, res) => {
-    try { if (!browser || !browser.isConnected()) await initBrowser(); } catch(e) { console.error(e); }
+    // Attempt launch to verify configuration
+    try { 
+        if (!browser || !browser.isConnected()) await initBrowser(); 
+    } catch(e) { 
+        console.error("Health Check Launch Error:", e); 
+    }
+    
     res.json({ 
         status: 'ok', 
-        service: 'Photopea Worker (Docker Core)', 
-        browserConnected: !!(browser && browser.isConnected()) 
+        service: 'Photopea Worker (Docker)', 
+        browserConnected: !!(browser && browser.isConnected()),
+        chromePath: process.env.PUPPETEER_EXECUTABLE_PATH || 'Not Set'
     });
 });
 
