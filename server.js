@@ -2,11 +2,12 @@ const express = require('express');
 const puppeteer = require('puppeteer-core');
 const { google } = require('googleapis');
 const stream = require('stream');
+const fs = require('fs');
 const app = express();
 
 app.use(express.json({ limit: '50mb' }));
 
-// 1. Google Auth
+// 1. Google Auth setup
 const SCOPES = ['https://www.googleapis.com/auth/drive.file'];
 const auth = new google.auth.GoogleAuth({
     credentials: {
@@ -19,18 +20,33 @@ const drive = google.drive({ version: 'v3', auth });
 
 let browser;
 
-// 2. Initialize Browser
+// 2. Browser Launcher with "Path Finder"
 async function initBrowser() {
     if (browser && browser.isConnected()) return browser;
 
-    console.log("Launching Browser from ENV path...");
-    
-    // CRITICAL FIX: Use the path provided by the Docker image
-    // If local, fallback to a standard linux path
-    const execPath = process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome-stable';
+    console.log("Initializing Browser...");
+
+    // List of possible paths where Chrome might be hidden
+    const possiblePaths = [
+        process.env.PUPPETEER_EXECUTABLE_PATH,
+        '/usr/bin/google-chrome',
+        '/usr/bin/google-chrome-stable',
+        '/usr/bin/chromium',
+        '/usr/bin/chromium-browser',
+        '/opt/google/chrome/chrome'
+    ];
+
+    // Find the first path that actually exists
+    let executablePath = possiblePaths.find(path => path && fs.existsSync(path));
+
+    if (!executablePath) {
+        throw new Error(`CRITICAL: Could not find Chrome in any of these paths: ${possiblePaths.join(', ')}`);
+    }
+
+    console.log(`Found Chrome at: ${executablePath}`);
 
     browser = await puppeteer.launch({
-        executablePath: execPath,
+        executablePath: executablePath,
         headless: "new",
         args: [
             '--no-sandbox',
@@ -41,24 +57,22 @@ async function initBrowser() {
         ]
     });
     
-    console.log(`Browser Launched! (Path: ${execPath})`);
+    console.log("Browser Launched Successfully!");
     return browser;
 }
 
 // 3. Health Check
 app.get('/health', async (req, res) => {
-    // Attempt launch to verify configuration
-    try { 
-        if (!browser || !browser.isConnected()) await initBrowser(); 
-    } catch(e) { 
-        console.error("Health Check Launch Error:", e); 
+    try {
+        if (!browser || !browser.isConnected()) await initBrowser();
+    } catch (e) {
+        console.error("Health Check Launch Failed:", e.message);
     }
     
     res.json({ 
         status: 'ok', 
         service: 'Photopea Worker (Docker)', 
-        browserConnected: !!(browser && browser.isConnected()),
-        chromePath: process.env.PUPPETEER_EXECUTABLE_PATH || 'Not Set'
+        browserConnected: !!(browser && browser.isConnected())
     });
 });
 
@@ -175,5 +189,6 @@ app.post('/process-psd', async (req, res) => {
     }
 });
 
+// Start Server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Worker listening on port ${PORT}`));
