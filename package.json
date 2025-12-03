@@ -8,6 +8,6 @@
   "dependencies": {
     "express": "^4.19.2",
     "googleapis": "^134.0.0",
-    "puppeteer": "^22.0.0"
+    "puppeteer-core": "^22.0.0"
   }
 }
