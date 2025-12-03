@@ -1,5 +1,5 @@
 const express = require('express');
-const puppeteer = require('puppeteer'); // Use full puppeteer
+const puppeteer = require('puppeteer-core'); // Changed back to Core
 const { google } = require('googleapis');
 const stream = require('stream');
 const app = express();
@@ -19,14 +19,15 @@ const drive = google.drive({ version: 'v3', auth });
 
 let browser;
 
-// 2. Initialize Browser (Simple Version)
+// 2. Initialize Browser (The Docker Fix)
 async function initBrowser() {
     if (browser && browser.isConnected()) return browser;
 
     console.log("Launching Official Docker Browser...");
     
     browser = await puppeteer.launch({
-        // No executablePath needed! Docker handles it.
+        // 'google-chrome-stable' is available globally in this Docker image
+        executablePath: 'google-chrome-stable', 
         headless: "new",
         args: [
             '--no-sandbox',
@@ -42,12 +43,10 @@ async function initBrowser() {
 
 // 3. Health Check
 app.get('/health', async (req, res) => {
-    // Try to launch to prove it works
     try { if (!browser || !browser.isConnected()) await initBrowser(); } catch(e) { console.error(e); }
-    
     res.json({ 
         status: 'ok', 
-        service: 'Photopea Worker (Docker)', 
+        service: 'Photopea Worker (Docker Core)', 
         browserConnected: !!(browser && browser.isConnected()) 
     });
 });
