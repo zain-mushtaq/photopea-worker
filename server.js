@@ -7,7 +7,6 @@ const app = express();
 
 app.use(express.json({ limit: '50mb' }));
 
-// 1. Google Auth
 const SCOPES = ['https://www.googleapis.com/auth/drive.file'];
 const auth = new google.auth.GoogleAuth({
     credentials: {
@@ -20,21 +19,11 @@ const drive = google.drive({ version: 'v3', auth });
 
 let browser;
 
-// 2. Initialize Browser (Optimized for Low RAM)
 async function initBrowser() {
     if (browser && browser.isConnected()) return browser;
 
     console.log("Initializing Browser...");
-    
-    // 1. Try the Environment Variable first (Set by Docker Image)
-    let execPath = process.env.PUPPETEER_EXECUTABLE_PATH;
-    
-    // 2. If missing, try standard locations
-    if (!execPath || !fs.existsSync(execPath)) {
-        execPath = '/usr/bin/google-chrome-stable';
-    }
-
-    console.log(`Launching Chrome from: ${execPath}`);
+    const execPath = '/usr/bin/google-chrome-stable';
 
     browser = await puppeteer.launch({
         executablePath: execPath,
@@ -42,31 +31,22 @@ async function initBrowser() {
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage', // Important for Docker/Railway
-            '--single-process', // Saves RAM
+            '--disable-dev-shm-usage',
+            '--single-process',
             '--no-zygote',
-            '--disable-gl-drawing-for-tests', // Disable GPU things
-            '--mute-audio',
-            '--window-size=800,600', // Small window saves RAM
+            '--window-size=1280,720',
             '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         ]
     });
     
-    console.log("Browser Launched Successfully!");
+    console.log("Browser Launched!");
     return browser;
 }
 
-// 3. Health Check
 app.get('/health', async (req, res) => {
-    try { if (!browser || !browser.isConnected()) await initBrowser(); } catch(e) { console.error(e); }
-    res.json({ 
-        status: 'ok', 
-        service: 'Photopea Worker (Optimized)', 
-        browserConnected: !!(browser && browser.isConnected()) 
-    });
+    res.json({ status: 'ok', service: 'Photopea Worker', browserConnected: !!(browser && browser.isConnected()) });
 });
 
-// 4. Process PSD
 app.post('/process-psd', async (req, res) => {
     const { psdUrl, modifications } = req.body;
     console.log(`Processing PSD: ${psdUrl}`);
@@ -75,68 +55,82 @@ app.post('/process-psd', async (req, res) => {
     try {
         const b = await initBrowser();
         page = await b.newPage();
-        
-        // --- AGGRESSIVE RESOURCE BLOCKING (SPEED FIX) ---
+
+        // 1. ENABLE CONSOLE LOGGING (So we can see errors!)
+        page.on('console', msg => console.log('BROWSER LOG:', msg.text()));
+        page.on('pageerror', err => console.log('BROWSER ERROR:', err.toString()));
+
+        // 2. RELAXED BLOCKING (Only block Ads, NOT Scripts)
         await page.setRequestInterception(true);
         page.on('request', (req) => {
-            const type = req.resourceType();
             const url = req.url();
+            const type = req.resourceType();
             
-            // Block heavy assets and ads to save memory/CPU
+            // Block explicit ad domains only
             if (
-                ['image', 'media', 'font', 'stylesheet'].includes(type) || 
                 url.includes('googleads') || 
                 url.includes('doubleclick') || 
                 url.includes('googlesyndication') ||
-                url.includes('facebook') ||
-                url.includes('analytics')
+                url.includes('facebook.net') ||
+                url.includes('analytics') || 
+                type === 'media' // Block videos
             ) {
                 req.abort();
             } else {
-                req.continue();
+                req.continue(); // Allow everything else (CSS/Fonts/Scripts)
             }
         });
 
         console.log("Navigating to Photopea...");
         
-        // Load Photopea (Fast Wait)
+        // 3. Wait for Load (Increased Timeout)
         await page.goto('https://www.photopea.com', { 
             waitUntil: 'domcontentloaded', 
-            timeout: 60000 // 60s is usually enough for DOM
+            timeout: 90000 
         });
 
-        console.log("Page loaded. Waiting for App Init...");
+        console.log("Page loaded. Checking for App...");
 
-        // Wait for the global 'app' object to exist
-        await page.waitForFunction(() => window.app, { timeout: 60000 });
-
-        console.log("Photopea App Object Found. Injecting script...");
+        // 4. Wait for Photopea Object
+        try {
+            await page.waitForFunction(() => window.app, { timeout: 60000 });
+            console.log("Photopea App Ready!");
+        } catch (err) {
+            console.error("Photopea failed to init. Dumping page title...");
+            const title = await page.title();
+            throw new Error(`Photopea did not load. Page Title: ${title}`);
+        }
 
         let finalImageBuffer = null;
         await page.exposeFunction('sendImageToNode', (base64Data) => {
             finalImageBuffer = Buffer.from(base64Data.replace(/^data:image\/\w+;base64,/, ""), 'base64');
         });
 
-        // --- AUTOMATION SCRIPT ---
+        // 5. Run Automation
         await page.evaluate(async (url, mods) => {
-            console.log("Browser: Downloading PSD...");
+            console.log("Browser: Starting automation...");
             
             async function loadBinary(url) {
-                const resp = await fetch(url);
-                if (!resp.ok) throw new Error("Failed to fetch: " + url);
-                return await resp.arrayBuffer();
+                try {
+                    const resp = await fetch(url);
+                    if (!resp.ok) throw new Error("Fetch failed: " + resp.statusText);
+                    return await resp.arrayBuffer();
+                } catch (e) {
+                    console.error("Download Error:", e);
+                    throw e;
+                }
             }
             
             const psdBuffer = await loadBinary(url);
-            console.log("Browser: Opening PSD...");
+            console.log("Browser: Opening PSD (" + psdBuffer.byteLength + " bytes)...");
             
-            // Open the file
             await window.app.open(psdBuffer, "template.psd");
-            
             const doc = window.app.activeDocument;
-            console.log("Browser: PSD Opened. Layers: " + doc.layers.length);
+            
+            if (!doc) throw new Error("Document failed to open in Photopea");
 
-            // Helper: Recursive Layer Finder
+            console.log("Browser: PSD Opened. Processing Layers...");
+
             function findLayer(layers, name) {
                 if(!layers) return null;
                 for (let i = 0; i < layers.length; i++) {
@@ -149,10 +143,10 @@ app.post('/process-psd', async (req, res) => {
                 return null;
             }
 
-            // Apply Mods
             for (const mod of mods) {
                 const layer = findLayer(doc.layers, mod.layerName);
                 if (layer) {
+                    console.log("Found layer: " + mod.layerName);
                     if (mod.text && layer.kind === LayerKind.TEXT) {
                         layer.textItem.contents = mod.text;
                     } else if (mod.image) {
@@ -160,13 +154,14 @@ app.post('/process-psd', async (req, res) => {
                         const imgBuffer = await loadBinary(mod.image);
                         await window.app.open(imgBuffer, "replacement.jpg", true); 
                     }
+                } else {
+                    console.warn("Layer not found: " + mod.layerName);
                 }
             }
             
-            console.log("Browser: Saving JPG...");
+            console.log("Browser: Saving Output...");
             const arrayBuffer = await doc.saveToOE("jpg"); 
             
-            // Send back to Node
             const blob = new Blob([arrayBuffer]);
             const reader = new FileReader();
             return new Promise((resolve) => {
@@ -178,7 +173,6 @@ app.post('/process-psd', async (req, res) => {
             });
         }, psdUrl, modifications);
 
-        // Wait for render response
         const startWait = Date.now();
         while (!finalImageBuffer) {
             if (Date.now() - startWait > 120000) throw new Error("Timeout waiting for image render");
