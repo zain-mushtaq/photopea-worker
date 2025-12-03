@@ -1,7 +1,6 @@
-# Use the official Puppeteer image (comes with Chrome pre-installed!)
 FROM ghcr.io/puppeteer/puppeteer:latest
 
-# Switch to root user to install your other libraries
+# Switch to root to install dependencies
 USER root
 
 WORKDIR /usr/src/app
@@ -9,11 +8,15 @@ WORKDIR /usr/src/app
 # Copy package files
 COPY package*.json ./
 
-# Install Express, Google Drive API, etc.
+# Install dependencies
 RUN npm install
 
-# Copy your server code
+# Copy source code
 COPY . .
+
+# CRITICAL FIX: Locate Google Chrome and set the Environment Variable
+# This runs 'which google-chrome' to find the real path and sets it permanently
+ENV PUPPETEER_EXECUTABLE_PATH="/usr/bin/google-chrome"
 
 # Switch back to the secure user
 USER pptruser
