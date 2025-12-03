@@ -7,7 +7,7 @@ const app = express();
 
 app.use(express.json({ limit: '50mb' }));
 
-// 1. Google Drive Auth
+// 1. Google Auth
 const SCOPES = ['https://www.googleapis.com/auth/drive.file'];
 const auth = new google.auth.GoogleAuth({
     credentials: {
@@ -20,16 +20,18 @@ const drive = google.drive({ version: 'v3', auth });
 
 let browser;
 
-// 2. Initialize Browser
+// 2. Initialize Browser (Optimized for Low RAM)
 async function initBrowser() {
     if (browser && browser.isConnected()) return browser;
 
     console.log("Initializing Browser...");
     
-    // Use the Docker image's path
+    // 1. Try the Environment Variable first (Set by Docker Image)
     let execPath = process.env.PUPPETEER_EXECUTABLE_PATH;
+    
+    // 2. If missing, try standard locations
     if (!execPath || !fs.existsSync(execPath)) {
-        execPath = '/usr/bin/google-chrome-stable'; // Fallback
+        execPath = '/usr/bin/google-chrome-stable';
     }
 
     console.log(`Launching Chrome from: ${execPath}`);
@@ -40,10 +42,12 @@ async function initBrowser() {
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--single-process',
+            '--disable-dev-shm-usage', // Important for Docker/Railway
+            '--single-process', // Saves RAM
             '--no-zygote',
-            // FAKE A REAL USER AGENT (Crucial for some sites)
+            '--disable-gl-drawing-for-tests', // Disable GPU things
+            '--mute-audio',
+            '--window-size=800,600', // Small window saves RAM
             '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         ]
     });
@@ -54,15 +58,10 @@ async function initBrowser() {
 
 // 3. Health Check
 app.get('/health', async (req, res) => {
-    try {
-        if (!browser || !browser.isConnected()) await initBrowser();
-    } catch (e) {
-        console.error("Health Check Launch Error:", e.message);
-    }
-    
+    try { if (!browser || !browser.isConnected()) await initBrowser(); } catch(e) { console.error(e); }
     res.json({ 
         status: 'ok', 
-        service: 'Photopea Worker (Docker)', 
+        service: 'Photopea Worker (Optimized)', 
         browserConnected: !!(browser && browser.isConnected()) 
     });
 });
@@ -77,34 +76,50 @@ app.post('/process-psd', async (req, res) => {
         const b = await initBrowser();
         page = await b.newPage();
         
-        // --- FIX: REMOVED RESOURCE INTERCEPTION ---
-        // (Allowing all assets to load prevents the app from hanging)
-
-        // --- FIX: CHANGED WAIT CONDITION ---
-        // 'domcontentloaded' is much faster than 'networkidle0'
-        await page.goto('https://www.photopea.com', { 
-            waitUntil: 'domcontentloaded', 
-            timeout: 120000 
+        // --- AGGRESSIVE RESOURCE BLOCKING (SPEED FIX) ---
+        await page.setRequestInterception(true);
+        page.on('request', (req) => {
+            const type = req.resourceType();
+            const url = req.url();
+            
+            // Block heavy assets and ads to save memory/CPU
+            if (
+                ['image', 'media', 'font', 'stylesheet'].includes(type) || 
+                url.includes('googleads') || 
+                url.includes('doubleclick') || 
+                url.includes('googlesyndication') ||
+                url.includes('facebook') ||
+                url.includes('analytics')
+            ) {
+                req.abort();
+            } else {
+                req.continue();
+            }
         });
 
-        console.log("Page loaded. Waiting for Photopea App...");
+        console.log("Navigating to Photopea...");
+        
+        // Load Photopea (Fast Wait)
+        await page.goto('https://www.photopea.com', { 
+            waitUntil: 'domcontentloaded', 
+            timeout: 60000 // 60s is usually enough for DOM
+        });
 
-        // Wait for Photopea to initialize (with long timeout)
-        await page.waitForFunction(
-            () => window.app && typeof window.app.open === 'function', 
-            { timeout: 120000 }
-        );
+        console.log("Page loaded. Waiting for App Init...");
 
-        console.log("Photopea ready. Injecting script...");
+        // Wait for the global 'app' object to exist
+        await page.waitForFunction(() => window.app, { timeout: 60000 });
+
+        console.log("Photopea App Object Found. Injecting script...");
 
         let finalImageBuffer = null;
         await page.exposeFunction('sendImageToNode', (base64Data) => {
             finalImageBuffer = Buffer.from(base64Data.replace(/^data:image\/\w+;base64,/, ""), 'base64');
         });
 
-        // Automate Photopea
+        // --- AUTOMATION SCRIPT ---
         await page.evaluate(async (url, mods) => {
-            console.log("Inside Browser: Downloading PSD...");
+            console.log("Browser: Downloading PSD...");
             
             async function loadBinary(url) {
                 const resp = await fetch(url);
@@ -113,13 +128,15 @@ app.post('/process-psd', async (req, res) => {
             }
             
             const psdBuffer = await loadBinary(url);
-            console.log("Inside Browser: Opening PSD...");
-            await app.open(psdBuffer, "template.psd");
+            console.log("Browser: Opening PSD...");
             
-            const doc = app.activeDocument;
-            console.log("Inside Browser: PSD Opened. Layers: " + doc.layers.length);
+            // Open the file
+            await window.app.open(psdBuffer, "template.psd");
+            
+            const doc = window.app.activeDocument;
+            console.log("Browser: PSD Opened. Layers: " + doc.layers.length);
 
-            // Helper to find layers
+            // Helper: Recursive Layer Finder
             function findLayer(layers, name) {
                 if(!layers) return null;
                 for (let i = 0; i < layers.length; i++) {
@@ -132,7 +149,7 @@ app.post('/process-psd', async (req, res) => {
                 return null;
             }
 
-            // Modifications
+            // Apply Mods
             for (const mod of mods) {
                 const layer = findLayer(doc.layers, mod.layerName);
                 if (layer) {
@@ -141,12 +158,12 @@ app.post('/process-psd', async (req, res) => {
                     } else if (mod.image) {
                         doc.activeLayer = layer;
                         const imgBuffer = await loadBinary(mod.image);
-                        await app.open(imgBuffer, "replacement.jpg", true); 
+                        await window.app.open(imgBuffer, "replacement.jpg", true); 
                     }
                 }
             }
             
-            console.log("Inside Browser: Saving JPG...");
+            console.log("Browser: Saving JPG...");
             const arrayBuffer = await doc.saveToOE("jpg"); 
             
             // Send back to Node
@@ -161,7 +178,7 @@ app.post('/process-psd', async (req, res) => {
             });
         }, psdUrl, modifications);
 
-        // Wait for render
+        // Wait for render response
         const startWait = Date.now();
         while (!finalImageBuffer) {
             if (Date.now() - startWait > 120000) throw new Error("Timeout waiting for image render");
