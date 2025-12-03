@@ -2,7 +2,6 @@ const express = require('express');
 const puppeteer = require('puppeteer-core');
 const { google } = require('googleapis');
 const stream = require('stream');
-const fs = require('fs');
 const app = express();
 
 app.use(express.json({ limit: '50mb' }));
@@ -20,33 +19,14 @@ const drive = google.drive({ version: 'v3', auth });
 
 let browser;
 
-// 2. Initialize Browser
+// 2. Initialize Browser (Hardcoded Path)
 async function initBrowser() {
     if (browser && browser.isConnected()) return browser;
 
-    console.log("Initializing Browser...");
-    
-    // The official Docker image sets this ENV var automatically.
-    // We log it to be sure.
-    const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
-    console.log(`Env var PUPPETEER_EXECUTABLE_PATH is: ${envPath}`);
+    console.log("Launching Manual Chrome...");
 
-    // If the env var is missing, fallback to standard locations
-    const possiblePaths = [
-        envPath,
-        '/usr/bin/google-chrome',
-        '/usr/bin/chromium',
-        '/usr/bin/google-chrome-stable'
-    ];
-
-    // Find the first valid path
-    const executablePath = possiblePaths.find(path => path && fs.existsSync(path));
-
-    if (!executablePath) {
-        throw new Error(`CRITICAL: Could not find Chrome. Searched: ${possiblePaths.join(', ')}`);
-    }
-
-    console.log(`Launching Chrome from: ${executablePath}`);
+    // We installed this SPECIFICALLY in the Dockerfile
+    const executablePath = '/usr/bin/google-chrome-stable';
 
     browser = await puppeteer.launch({
         executablePath: executablePath,
@@ -60,7 +40,7 @@ async function initBrowser() {
         ]
     });
     
-    console.log("Browser Launched Successfully!");
+    console.log(`Browser Launched Successfully at ${executablePath}!`);
     return browser;
 }
 
@@ -74,9 +54,8 @@ app.get('/health', async (req, res) => {
     
     res.json({ 
         status: 'ok', 
-        service: 'Photopea Worker', 
-        browserConnected: !!(browser && browser.isConnected()),
-        chromePath: process.env.PUPPETEER_EXECUTABLE_PATH || "Not Detected"
+        service: 'Photopea Worker (Manual Docker)', 
+        browserConnected: !!(browser && browser.isConnected())
     });
 });
 
