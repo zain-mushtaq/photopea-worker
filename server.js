@@ -1,5 +1,6 @@
 const express = require('express');
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-core');
+const chromium = require('@sparticuz/chromium');
 const { google } = require('googleapis');
 const stream = require('stream');
 const app = express();
@@ -12,7 +13,7 @@ const auth = new google.auth.GoogleAuth({
     credentials: {
         client_email: process.env.GOOGLE_CLIENT_EMAIL,
         // Fix newline characters in private key for Railway environment variables
-        private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'), 
+        private_key: (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n'), 
     },
     scopes: SCOPES,
 });
@@ -21,19 +22,29 @@ const drive = google.drive({ version: 'v3', auth });
 let browser;
 
 async function initBrowser() {
-    if (!browser || !browser.isConnected()) {
-        console.log("Launching Browser...");
-        browser = await puppeteer.launch({
-            headless: "new",
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--single-process']
-        });
-        console.log("Browser Launched!");
-    }
+    // Check if browser is already running and connected
+    if (browser && browser.isConnected()) return browser;
+
+    console.log("Launching Lightweight Browser...");
+    
+    // Use @sparticuz/chromium to locate the binary (much faster setup)
+    const executablePath = await chromium.executablePath();
+
+    browser = await puppeteer.launch({
+        args: chromium.args,
+        defaultViewport: chromium.defaultViewport,
+        executablePath: executablePath,
+        headless: chromium.headless,
+        ignoreHTTPSErrors: true
+    });
+    
+    console.log("Browser Launched!");
     return browser;
 }
 
 app.get('/health', async (req, res) => {
-    res.json({ status: 'ok', service: 'Photopea Worker (Google Drive)', browserConnected: !!(browser && browser.isConnected()) });
+    const isConnected = !!(browser && browser.isConnected());
+    res.json({ status: 'ok', service: 'Photopea Worker (Lightweight)', browserConnected: isConnected });
 });
 
 app.post('/process-psd', async (req, res) => {
@@ -44,6 +55,8 @@ app.post('/process-psd', async (req, res) => {
     try {
         const b = await initBrowser();
         page = await b.newPage();
+        
+        // Optimizations
         await page.setRequestInterception(true);
         page.on('request', (req) => {
             if (['font', 'stylesheet', 'media'].includes(req.resourceType())) req.abort();
@@ -106,19 +119,18 @@ app.post('/process-psd', async (req, res) => {
 
         const startWait = Date.now();
         while (!finalImageBuffer) {
-            if (Date.now() - startWait > 30000) throw new Error("Timeout waiting for image render");
+            if (Date.now() - startWait > 45000) throw new Error("Timeout waiting for image render");
             await new Promise(r => setTimeout(r, 500));
         }
 
         console.log("Image rendered. Uploading to Google Drive...");
 
-        // Upload to Google Drive
         const bufferStream = new stream.PassThrough();
         bufferStream.end(finalImageBuffer);
 
         const fileMetadata = {
             name: `generated_${Date.now()}.jpg`,
-            parents: [process.env.GOOGLE_DRIVE_FOLDER_ID] // Upload to specific folder
+            parents: [process.env.GOOGLE_DRIVE_FOLDER_ID]
         };
         
         const media = {
@@ -132,7 +144,7 @@ app.post('/process-psd', async (req, res) => {
             fields: 'id, webViewLink, webContentLink'
         });
 
-        // Make file public (Optional - enables direct viewing link)
+        // Make file public so n8n can see it
         await drive.permissions.create({
             fileId: file.data.id,
             requestBody: {
@@ -142,8 +154,6 @@ app.post('/process-psd', async (req, res) => {
         });
 
         console.log("Done! File ID:", file.data.id);
-        
-        // webViewLink is the preview link, webContentLink is the direct download
         res.json({ success: true, url: file.data.webViewLink, downloadUrl: file.data.webContentLink });
 
     } catch (e) {
