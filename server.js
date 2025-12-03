@@ -2,15 +2,18 @@ const express = require('express');
 const puppeteer = require('puppeteer-core');
 const { google } = require('googleapis');
 const stream = require('stream');
+const fs = require('fs');
 const app = express();
 
+// Allow large payloads (for big PSD JSON data if needed)
 app.use(express.json({ limit: '50mb' }));
 
-// 1. Google Auth
+// 1. Google Drive Auth
 const SCOPES = ['https://www.googleapis.com/auth/drive.file'];
 const auth = new google.auth.GoogleAuth({
     credentials: {
         client_email: process.env.GOOGLE_CLIENT_EMAIL,
+        // Handle private key newlines correctly
         private_key: (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
     },
     scopes: SCOPES,
@@ -19,17 +22,34 @@ const drive = google.drive({ version: 'v3', auth });
 
 let browser;
 
-// 2. Initialize Browser (Hardcoded Path)
+// 2. Initialize Browser
 async function initBrowser() {
     if (browser && browser.isConnected()) return browser;
 
-    console.log("Launching Manual Chrome...");
+    console.log("Initializing Browser...");
+    
+    // 1. Try the Environment Variable first (Set by Docker Image)
+    let execPath = process.env.PUPPETEER_EXECUTABLE_PATH;
+    
+    // 2. If missing, try standard locations
+    if (!execPath || !fs.existsSync(execPath)) {
+        const possiblePaths = [
+            '/usr/bin/google-chrome-stable',
+            '/usr/bin/google-chrome',
+            '/usr/bin/chromium',
+            '/usr/bin/chromium-browser'
+        ];
+        execPath = possiblePaths.find(path => fs.existsSync(path));
+    }
 
-    // We installed this SPECIFICALLY in the Dockerfile
-    const executablePath = '/usr/bin/google-chrome-stable';
+    if (!execPath) {
+        throw new Error("CRITICAL: Could not find Google Chrome executable. Please check Dockerfile.");
+    }
+
+    console.log(`Launching Chrome from: ${execPath}`);
 
     browser = await puppeteer.launch({
-        executablePath: executablePath,
+        executablePath: execPath,
         headless: "new",
         args: [
             '--no-sandbox',
@@ -40,22 +60,23 @@ async function initBrowser() {
         ]
     });
     
-    console.log(`Browser Launched Successfully at ${executablePath}!`);
+    console.log("Browser Launched Successfully!");
     return browser;
 }
 
 // 3. Health Check
 app.get('/health', async (req, res) => {
     try {
+        // Try to launch if not ready
         if (!browser || !browser.isConnected()) await initBrowser();
     } catch (e) {
-        console.error("Health Check Failed:", e.message);
+        console.error("Health Check Launch Error:", e.message);
     }
     
     res.json({ 
         status: 'ok', 
-        service: 'Photopea Worker (Manual Docker)', 
-        browserConnected: !!(browser && browser.isConnected())
+        service: 'Photopea Worker', 
+        browserConnected: !!(browser && browser.isConnected()) 
     });
 });
 
@@ -69,20 +90,31 @@ app.post('/process-psd', async (req, res) => {
         const b = await initBrowser();
         page = await b.newPage();
         
+        // Speed Optimization: Block fonts/images/css
         await page.setRequestInterception(true);
         page.on('request', (req) => {
             if (['font', 'stylesheet', 'media'].includes(req.resourceType())) req.abort();
             else req.continue();
         });
 
-        await page.goto('https://www.photopea.com', { waitUntil: 'networkidle0', timeout: 60000 });
-        await page.waitForFunction(() => window.app && typeof window.app.open === 'function');
+        // Go to Photopea (Increased Timeout to 2 mins)
+        await page.goto('https://www.photopea.com', { 
+            waitUntil: 'networkidle0', 
+            timeout: 120000 
+        });
+
+        // Wait for App Ready (Increased Timeout)
+        await page.waitForFunction(
+            () => window.app && typeof window.app.open === 'function', 
+            { timeout: 120000 }
+        );
 
         let finalImageBuffer = null;
         await page.exposeFunction('sendImageToNode', (base64Data) => {
             finalImageBuffer = Buffer.from(base64Data.replace(/^data:image\/\w+;base64,/, ""), 'base64');
         });
 
+        // Inject Script
         await page.evaluate(async (url, mods) => {
             async function loadBinary(url) {
                 const resp = await fetch(url);
@@ -129,14 +161,16 @@ app.post('/process-psd', async (req, res) => {
             });
         }, psdUrl, modifications);
 
+        // Wait for Render (Increased Timeout to 2 mins)
         const startWait = Date.now();
         while (!finalImageBuffer) {
-            if (Date.now() - startWait > 60000) throw new Error("Timeout waiting for image render");
+            if (Date.now() - startWait > 120000) throw new Error("Timeout waiting for image render");
             await new Promise(r => setTimeout(r, 500));
         }
 
         console.log("Image rendered. Uploading to Google Drive...");
 
+        // Upload to Google Drive
         const bufferStream = new stream.PassThrough();
         bufferStream.end(finalImageBuffer);
 
@@ -156,6 +190,7 @@ app.post('/process-psd', async (req, res) => {
             fields: 'id, webViewLink, webContentLink'
         });
 
+        // Make Public
         await drive.permissions.create({
             fileId: file.data.id,
             requestBody: { role: 'reader', type: 'anyone' },
@@ -172,5 +207,6 @@ app.post('/process-psd', async (req, res) => {
     }
 });
 
+// Start Server (Using ENV Port)
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Worker listening on port ${PORT}`));
