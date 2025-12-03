@@ -1,13 +1,12 @@
 const express = require('express');
-const puppeteer = require('puppeteer-core');
+const puppeteer = require('puppeteer'); // Use full puppeteer
 const { google } = require('googleapis');
 const stream = require('stream');
-const { execSync } = require('child_process'); // Needed to find Chromium
 const app = express();
 
 app.use(express.json({ limit: '50mb' }));
 
-// 1. Setup Google Drive Auth
+// 1. Google Auth
 const SCOPES = ['https://www.googleapis.com/auth/drive.file'];
 const auth = new google.auth.GoogleAuth({
     credentials: {
@@ -20,24 +19,14 @@ const drive = google.drive({ version: 'v3', auth });
 
 let browser;
 
-// 2. Initialize Browser (Dynamic Path Finding)
+// 2. Initialize Browser (Simple Version)
 async function initBrowser() {
     if (browser && browser.isConnected()) return browser;
 
-    console.log("Searching for Chromium...");
+    console.log("Launching Official Docker Browser...");
     
-    // Dynamically find where Nixpacks installed Chromium
-    let executablePath;
-    try {
-        executablePath = execSync('which chromium').toString().trim();
-        console.log(`Found Chromium at: ${executablePath}`);
-    } catch (e) {
-        console.error("Could not find 'chromium' in PATH. Trying fallback...");
-        executablePath = '/usr/bin/chromium'; // Fallback
-    }
-
     browser = await puppeteer.launch({
-        executablePath: executablePath,
+        // No executablePath needed! Docker handles it.
         headless: "new",
         args: [
             '--no-sandbox',
@@ -47,27 +36,23 @@ async function initBrowser() {
         ]
     });
     
-    console.log("Browser Launched Successfully!");
+    console.log("Browser Launched!");
     return browser;
 }
 
 // 3. Health Check
 app.get('/health', async (req, res) => {
-    // Attempt to launch browser if not connected, just to test
-    try {
-        if (!browser || !browser.isConnected()) await initBrowser();
-    } catch (e) {
-        console.error("Health check browser launch failed:", e);
-    }
+    // Try to launch to prove it works
+    try { if (!browser || !browser.isConnected()) await initBrowser(); } catch(e) { console.error(e); }
     
     res.json({ 
         status: 'ok', 
-        service: 'Photopea Worker', 
+        service: 'Photopea Worker (Docker)', 
         browserConnected: !!(browser && browser.isConnected()) 
     });
 });
 
-// 4. Main Process Endpoint
+// 4. Process PSD
 app.post('/process-psd', async (req, res) => {
     const { psdUrl, modifications } = req.body;
     console.log(`Processing PSD: ${psdUrl}`);
