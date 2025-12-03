@@ -1,27 +1,34 @@
-# Use the official Puppeteer image (Comes with Chrome pre-installed)
-FROM ghcr.io/puppeteer/puppeteer:latest
+# Start with a standard Node.js image
+FROM node:18
 
-# Switch to root to install dependencies
-USER root
+# 1. Install Google Chrome Stable and fonts
+# This guarantees we know EXACTLY where Chrome is (/usr/bin/google-chrome-stable)
+RUN apt-get update \
+    && apt-get install -y wget gnupg \
+    && wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/googlechrome-linux-keyring.gpg \
+    && sh -c 'echo "deb [arch=amd64 signed-by=/usr/share/keyrings/googlechrome-linux-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list' \
+    && apt-get update \
+    && apt-get install -y google-chrome-stable fonts-ipafont-gothic fonts-wqy-zenhei fonts-thai-tlwg fonts-kacst fonts-freefont-ttf libxss1 \
+      --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
 
+# 2. Setup App Directory
 WORKDIR /usr/src/app
 
-# Copy package files
+# 3. Install Dependencies
 COPY package*.json ./
-
-# Install dependencies (Express, Google APIs)
-# Note: We use 'npm ci' for a cleaner install and skip puppeteer download since it's in the base image
 RUN npm install
 
-# Copy source code
+# 4. Copy Source Code
 COPY . .
 
-# --- IMPORTANT: WE REMOVED THE ENV LINE HERE ---
-# The base image already sets PUPPETEER_EXECUTABLE_PATH correctly.
-# Do not overwrite it.
+# 5. Setup Permissions (Security)
+RUN groupadd -r pptruser && useradd -r -g pptruser -G audio,video pptruser \
+    && mkdir -p /home/pptruser/Downloads \
+    && chown -R pptruser:pptruser /home/pptruser \
+    && chown -R pptruser:pptruser /usr/src/app
 
-# Switch back to the secure user
 USER pptruser
 
-# Start the server
+# 6. Start Server
 CMD ["node", "server.js"]
