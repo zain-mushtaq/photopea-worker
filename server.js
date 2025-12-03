@@ -22,20 +22,21 @@ let browser;
 async function initBrowser() {
     if (browser && browser.isConnected()) return browser;
 
-    console.log("Initializing Browser...");
+    console.log("Initializing Browser (Compatibility Mode)...");
     const execPath = '/usr/bin/google-chrome-stable';
 
     browser = await puppeteer.launch({
         executablePath: execPath,
-        headless: "new",
+        headless: "new", // Use new headless mode
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
             '--single-process',
-            '--no-zygote',
-            '--window-size=1280,720',
-            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            // REMOVED: --disable-gl-drawing-for-tests (Photopea needs WebGL)
+            '--window-size=1366,768',
+            // Real User Agent to look like a normal human
+            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
         ]
     });
     
@@ -56,59 +57,41 @@ app.post('/process-psd', async (req, res) => {
         const b = await initBrowser();
         page = await b.newPage();
 
-        // 1. ENABLE CONSOLE LOGGING (So we can see errors!)
+        // 1. ENABLE LOGGING
         page.on('console', msg => console.log('BROWSER LOG:', msg.text()));
         page.on('pageerror', err => console.log('BROWSER ERROR:', err.toString()));
 
-        // 2. RELAXED BLOCKING (Only block Ads, NOT Scripts)
-        await page.setRequestInterception(true);
-        page.on('request', (req) => {
-            const url = req.url();
-            const type = req.resourceType();
-            
-            // Block explicit ad domains only
-            if (
-                url.includes('googleads') || 
-                url.includes('doubleclick') || 
-                url.includes('googlesyndication') ||
-                url.includes('facebook.net') ||
-                url.includes('analytics') || 
-                type === 'media' // Block videos
-            ) {
-                req.abort();
-            } else {
-                req.continue(); // Allow everything else (CSS/Fonts/Scripts)
-            }
-        });
+        // 2. NO REQUEST INTERCEPTION (Allow Everything)
+        // We removed the block causing net::ERR_FAILED
 
         console.log("Navigating to Photopea...");
         
-        // 3. Wait for Load (Increased Timeout)
+        // 3. Load Page
         await page.goto('https://www.photopea.com', { 
             waitUntil: 'domcontentloaded', 
-            timeout: 90000 
+            timeout: 120000 
         });
 
-        console.log("Page loaded. Checking for App...");
+        console.log("Page loaded. Waiting for UI...");
 
-        // 4. Wait for Photopea Object
-        try {
-            await page.waitForFunction(() => window.app, { timeout: 60000 });
-            console.log("Photopea App Ready!");
-        } catch (err) {
-            console.error("Photopea failed to init. Dumping page title...");
-            const title = await page.title();
-            throw new Error(`Photopea did not load. Page Title: ${title}`);
-        }
+        // 4. Wait for the specific UI element (The main editor body)
+        // This confirms the app actually rendered
+        await page.waitForSelector('.photopea', { timeout: 60000 });
+        console.log("Photopea UI Found!");
 
+        console.log("Waiting for global 'app' object...");
+        await page.waitForFunction(() => window.app, { timeout: 60000 });
+        console.log("Photopea Logic Ready!");
+
+        // 5. Setup Data Transfer
         let finalImageBuffer = null;
         await page.exposeFunction('sendImageToNode', (base64Data) => {
             finalImageBuffer = Buffer.from(base64Data.replace(/^data:image\/\w+;base64,/, ""), 'base64');
         });
 
-        // 5. Run Automation
+        // 6. Run Automation
         await page.evaluate(async (url, mods) => {
-            console.log("Browser: Starting automation...");
+            console.log("Browser: Starting script...");
             
             async function loadBinary(url) {
                 try {
@@ -121,19 +104,21 @@ app.post('/process-psd', async (req, res) => {
                 }
             }
             
+            console.log("Browser: Downloading PSD...");
             const psdBuffer = await loadBinary(url);
-            console.log("Browser: Opening PSD (" + psdBuffer.byteLength + " bytes)...");
             
+            console.log("Browser: Opening PSD in App...");
             await window.app.open(psdBuffer, "template.psd");
-            const doc = window.app.activeDocument;
             
-            if (!doc) throw new Error("Document failed to open in Photopea");
+            const doc = window.app.activeDocument;
+            if (!doc) throw new Error("Active document not found after open()");
 
-            console.log("Browser: PSD Opened. Processing Layers...");
+            console.log("Browser: PSD Opened. Layers: " + doc.layers.length);
 
             function findLayer(layers, name) {
                 if(!layers) return null;
                 for (let i = 0; i < layers.length; i++) {
+                    // Helper: Check exact name match
                     if (layers[i].name === name) return layers[i];
                     if (layers[i].layers) {
                         const found = findLayer(layers[i].layers, name);
@@ -144,22 +129,25 @@ app.post('/process-psd', async (req, res) => {
             }
 
             for (const mod of mods) {
+                console.log("Looking for layer:", mod.layerName);
                 const layer = findLayer(doc.layers, mod.layerName);
+                
                 if (layer) {
-                    console.log("Found layer: " + mod.layerName);
+                    console.log("Found layer. Applying mod...");
                     if (mod.text && layer.kind === LayerKind.TEXT) {
                         layer.textItem.contents = mod.text;
                     } else if (mod.image) {
                         doc.activeLayer = layer;
                         const imgBuffer = await loadBinary(mod.image);
+                        // 'true' means open as Smart Object into current file
                         await window.app.open(imgBuffer, "replacement.jpg", true); 
                     }
                 } else {
-                    console.warn("Layer not found: " + mod.layerName);
+                    console.warn("Layer NOT found:", mod.layerName);
                 }
             }
             
-            console.log("Browser: Saving Output...");
+            console.log("Browser: Saving JPG...");
             const arrayBuffer = await doc.saveToOE("jpg"); 
             
             const blob = new Blob([arrayBuffer]);
@@ -173,6 +161,7 @@ app.post('/process-psd', async (req, res) => {
             });
         }, psdUrl, modifications);
 
+        // 7. Wait for Result
         const startWait = Date.now();
         while (!finalImageBuffer) {
             if (Date.now() - startWait > 120000) throw new Error("Timeout waiting for image render");
