@@ -1,6 +1,6 @@
 FROM node:18-slim
 
-# Install Xvfb for virtual display + Chrome and dependencies
+# Install Chrome and dependencies
 RUN apt-get update && apt-get install -y \
     wget gnupg ca-certificates \
     fonts-liberation \
@@ -22,7 +22,6 @@ RUN apt-get update && apt-get install -y \
     libxkbcommon0 \
     libxrandr2 \
     xdg-utils \
-    xvfb \
     && wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/googlechrome-linux-keyring.gpg \
     && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/googlechrome-linux-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list \
     && apt-get update \
@@ -51,7 +50,4 @@ RUN groupadd -r pptruser && \
 
 USER pptruser
 
-# Start Xvfb (virtual display) before running node
-CMD Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp & \
-    sleep 2 && \
-    node server.js
+CMD ["node", "server.js"]
