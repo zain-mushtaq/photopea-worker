@@ -16,20 +16,17 @@ const auth = new google.auth.GoogleAuth({
 });
 const drive = google.drive({ version: 'v3', auth });
 
-// DON'T keep a global browser - create fresh for each request
 async function createBrowser() {
     console.log("Creating fresh browser instance...");
     
     const browser = await puppeteer.launch({
         executablePath: '/usr/bin/google-chrome-stable',
-        headless: "new",
+        headless: 'new',
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
             '--disable-gpu',
-            '--single-process',
-            '--no-zygote',
             '--disable-software-rasterizer',
             '--disable-dev-tools',
             '--no-first-run',
@@ -42,7 +39,19 @@ async function createBrowser() {
             '--mute-audio',
             '--no-default-browser-check',
             '--safebrowsing-disable-auto-update',
-            '--window-size=1920,1080'
+            '--disable-features=IsolateOrigins,site-per-process',
+            '--disable-blink-features=AutomationControlled',
+            '--window-size=1920,1080',
+            // Railway-specific flags
+            '--disable-crash-reporter',
+            '--disable-in-process-stack-traces',
+            '--disable-logging',
+            '--disable-breakpad',
+            '--log-level=3',
+            '--user-data-dir=/tmp/chrome-user-data',
+            '--data-path=/tmp/chrome-data',
+            '--homedir=/tmp',
+            '--disk-cache-dir=/tmp/cache'
         ],
         timeout: 60000
     });
@@ -55,7 +64,8 @@ app.get('/health', async (req, res) => {
     res.json({ 
         status: 'ok', 
         service: 'Photopea Worker',
-        note: 'Browser created on-demand per request'
+        note: 'Browser created on-demand per request',
+        timestamp: new Date().toISOString()
     });
 });
 
@@ -63,6 +73,7 @@ app.post('/process-psd', async (req, res) => {
     const { psdUrl, modifications } = req.body;
     console.log(`\n=== New Request ===`);
     console.log(`Processing PSD: ${psdUrl}`);
+    console.log(`Modifications:`, JSON.stringify(modifications, null, 2));
     
     let browser;
     let page;
@@ -222,12 +233,18 @@ app.post('/process-psd', async (req, res) => {
         console.error(error.stack);
         res.status(500).json({ 
             success: false, 
-            error: error.message
+            error: error.message,
+            stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
         });
     } finally {
         // ALWAYS close page and browser after each request
         if (page) {
-            try { await page.close(); } catch (e) { console.log("Error closing page:", e.message); }
+            try { 
+                await page.close(); 
+                console.log("Page closed");
+            } catch (e) { 
+                console.log("Error closing page:", e.message); 
+            }
         }
         if (browser) {
             try { 
@@ -237,6 +254,7 @@ app.post('/process-psd', async (req, res) => {
                 console.log("Error closing browser:", e.message); 
             }
         }
+        console.log("=== Request Complete ===\n");
     }
 });
 
@@ -244,4 +262,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Photopea Worker running on port ${PORT}`);
     console.log(`Browser will be created fresh for each request`);
+    console.log(`Environment: ${process.env.NODE_ENV || 'production'}`);
 });
