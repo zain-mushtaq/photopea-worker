@@ -1,5 +1,6 @@
 FROM node:18-slim
 
+# Install Chrome and dependencies
 RUN apt-get update && apt-get install -y \
     wget gnupg ca-certificates \
     && wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/googlechrome-linux-keyring.gpg \
@@ -10,10 +11,17 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src/app
+
+# Copy package files
 COPY package*.json ./
-RUN npm ci --only=production
+
+# Use npm install instead of npm ci since you don't have package-lock.json
+RUN npm install --omit=dev
+
+# Copy source code
 COPY . .
 
+# Create non-root user
 RUN groupadd -r pptruser && useradd -r -g pptruser -G audio,video pptruser \
     && chown -R pptruser:pptruser /usr/src/app
 
