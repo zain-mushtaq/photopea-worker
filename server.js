@@ -21,11 +21,13 @@ async function createBrowser() {
     
     const browser = await puppeteer.launch({
         executablePath: '/usr/bin/google-chrome-stable',
-        headless: 'new',
+        // CRITICAL: Try headless: false with Xvfb (virtual display)
+        headless: false, // Changed to false
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
+            '--disable-gpu',
             '--disable-software-rasterizer',
             '--no-first-run',
             '--disable-background-networking',
@@ -41,15 +43,12 @@ async function createBrowser() {
             '--user-data-dir=/tmp/chrome-user-data',
             '--data-path=/tmp/chrome-data',
             '--disk-cache-dir=/tmp/cache',
-            // CRITICAL: Explicitly enable WebAssembly and JavaScript
-            '--enable-javascript',
-            '--js-flags=--expose-gc',
-            '--enable-webgl',
-            // Memory settings for WASM
-            '--disable-gpu-sandbox',
-            '--enable-unsafe-webgpu'
+            // Virtual display
+            '--display=:99',
+            // Additional anti-detection
+            '--disable-infobars',
+            '--disable-browser-side-navigation'
         ],
-        ignoreDefaultArgs: ['--disable-extensions'],
         timeout: 60000
     });
     
@@ -87,16 +86,25 @@ app.post('/process-psd', async (req, res) => {
                 get: () => false,
             });
             
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5],
+            });
+            
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en'],
+            });
+            
             window.chrome = {
                 runtime: {},
             };
             
-            // Ensure WebAssembly is available
-            if (typeof WebAssembly === 'undefined') {
-                console.error('CRITICAL: WebAssembly is not available!');
-            } else {
-                console.log('✓ WebAssembly is available');
-            }
+            // Override console.debug which Photopea might use for detection
+            const originalDebug = console.debug;
+            console.debug = function(...args) {
+                if (!args[0]?.includes?.('detection')) {
+                    originalDebug.apply(console, args);
+                }
+            };
         });
 
         // Console logging
@@ -106,94 +114,45 @@ app.post('/process-psd', async (req, res) => {
             console.log(`BROWSER [${type}]:`, text);
         });
         page.on('pageerror', err => console.error('PAGE ERROR:', err.toString()));
-        page.on('requestfailed', req => {
-            console.log('REQUEST FAILED:', req.url(), req.failure()?.errorText);
-        });
 
         console.log("Navigating to Photopea...");
         
-        const response = await page.goto('https://www.photopea.com/', { 
-            waitUntil: 'networkidle0', // Wait for all network activity to stop
+        await page.goto('https://www.photopea.com/', { 
+            waitUntil: 'networkidle0',
             timeout: 120000 
         });
         
-        console.log(`Page loaded with status: ${response.status()}`);
+        console.log("Page loaded. Waiting for Photopea...");
 
-        // DEBUG: Check WebAssembly and window.app availability
-        const debugInfo = await page.evaluate(() => {
-            return {
-                hasWebAssembly: typeof WebAssembly !== 'undefined',
-                canInstantiate: typeof WebAssembly?.instantiate === 'function',
-                hasApp: typeof window.app !== 'undefined',
-                appKeys: window.app ? Object.keys(window.app) : [],
-                userAgent: navigator.userAgent,
-                windowKeys: Object.keys(window).filter(k => k.includes('app') || k.includes('photo'))
-            };
-        });
-        
-        console.log("=== DEBUG INFO ===");
-        console.log(JSON.stringify(debugInfo, null, 2));
-        console.log("==================");
-
-        if (!debugInfo.hasWebAssembly) {
-            throw new Error("WebAssembly is NOT available in the browser context!");
-        }
-
-        console.log("Waiting for Photopea to initialize (checking window.app)...");
-        
-        // Try different approach: wait for any Photopea indication
-        let attempts = 0;
-        const maxAttempts = 60; // 60 seconds
-        
-        while (attempts < maxAttempts) {
+        // Custom polling with Promise-based delay
+        let ready = false;
+        for (let i = 0; i < 90; i++) {
             const status = await page.evaluate(() => {
-                // Check multiple possible states
                 if (typeof window.app !== 'undefined' && typeof window.app.open === 'function') {
-                    return { ready: true, message: 'window.app.open found' };
+                    return { ready: true };
                 }
-                
-                // Check if Photopea loaded but under different name
-                const photopeaScript = document.querySelector('script[src*="photopea"]');
-                if (photopeaScript) {
-                    return { ready: false, message: 'Photopea script found, still loading' };
-                }
-                
-                // Check for any errors in the page
-                const errors = window.__photopeaErrors || [];
-                if (errors.length > 0) {
-                    return { ready: false, message: `Errors: ${errors.join(', ')}` };
-                }
-                
-                return { ready: false, message: 'Still waiting for window.app' };
+                return { ready: false, message: 'window.app not ready' };
             });
             
             if (status.ready) {
-                console.log(`✓ ${status.message}`);
+                ready = true;
+                console.log("✓ Photopea initialized!");
                 break;
             }
             
-            if (attempts % 10 === 0) {
-                console.log(`[${attempts}s] ${status.message}`);
+            if (i % 10 === 0) {
+                console.log(`[${i}s] Waiting... ${status.message}`);
             }
             
-            attempts++;
-            await page.waitForTimeout(1000);
+            await new Promise(resolve => setTimeout(resolve, 1000));
         }
         
-        if (attempts >= maxAttempts) {
-            // Take a screenshot for debugging
-            const screenshot = await page.screenshot({ encoding: 'base64' });
-            console.log("Photopea failed to load. Screenshot captured (first 100 chars):", screenshot.substring(0, 100));
-            
-            // Get page content
-            const htmlContent = await page.content();
-            console.log("Page HTML (first 500 chars):", htmlContent.substring(0, 500));
-            
-            throw new Error("Photopea did not initialize after 60 seconds");
+        if (!ready) {
+            throw new Error("Photopea did not initialize after 90 seconds");
         }
         
-        console.log("✓ Photopea fully initialized!");
-        await page.waitForTimeout(2000);
+        // Extra stabilization delay
+        await new Promise(resolve => setTimeout(resolve, 3000));
 
         // Setup data transfer
         let finalImageBuffer = null;
@@ -224,7 +183,7 @@ app.post('/process-psd', async (req, res) => {
                 await new Promise(resolve => setTimeout(resolve, 3000));
                 
                 const doc = window.app.activeDocument;
-                if (!doc) throw new Error("No active document found after opening PSD");
+                if (!doc) throw new Error("No active document found");
 
                 console.log(`✓ PSD opened. Layers: ${doc.layers.length}`);
 
@@ -296,7 +255,7 @@ app.post('/process-psd', async (req, res) => {
         }
 
         if (!finalImageBuffer) {
-            throw new Error("Timeout waiting for image (180s)");
+            throw new Error("Timeout waiting for image");
         }
 
         console.log(`✓ Image received: ${finalImageBuffer.length} bytes`);
