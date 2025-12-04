@@ -29,7 +29,7 @@ async function createBrowser() {
             '--disable-gpu',
             '--disable-software-rasterizer',
             '--window-size=1920,1080',
-            '--user-data-dir=/tmp/chrome-user-data',
+            '--user-data-dir=/tmp/chrome-user-data-' + Date.now(), // Unique per request for localStorage
             '--enable-javascript'
         ],
         timeout: 60000
@@ -42,7 +42,7 @@ async function createBrowser() {
 app.get('/health', async (req, res) => {
     res.json({ 
         status: 'ok', 
-        service: 'Photopea Worker (iframe API)',
+        service: 'Photopea Worker (Direct API)',
         timestamp: new Date().toISOString()
     });
 });
@@ -65,197 +65,146 @@ app.post('/process-psd', async (req, res) => {
         page.on('console', msg => console.log(`BROWSER:`, msg.text()));
         page.on('pageerror', err => console.error('PAGE ERROR:', err.toString()));
 
-        console.log("Setting up wrapper page with Photopea iframe...");
+        console.log("Navigating directly to Photopea...");
         
-        // Create a wrapper HTML page that embeds Photopea in an iframe
-        const wrapperHTML = `
-<!DOCTYPE html>
-<html>
-<head>
-    <style>
-        body { margin: 0; padding: 0; }
-        #photopea-iframe { width: 100vw; height: 100vh; border: none; }
-    </style>
-</head>
-<body>
-    <iframe id="photopea-iframe" src="https://www.photopea.com"></iframe>
-    <script>
-        window.photopeaReady = false;
-        window.photopeaMessages = [];
-        
-        // Listen for messages from Photopea
-        window.addEventListener("message", function(e) {
-            console.log("Received from Photopea:", e.data);
-            window.photopeaMessages.push(e.data);
-            
-            if (e.data === "done") {
-                window.photopeaReady = true;
-            }
+        // Navigate directly to Photopea (not in iframe, so localStorage works)
+        await page.goto('https://www.photopea.com/', { 
+            waitUntil: 'networkidle2',
+            timeout: 120000 
         });
         
-        // Function to send messages to Photopea
-        window.sendToPhotopea = function(message) {
-            const iframe = document.getElementById("photopea-iframe");
-            iframe.contentWindow.postMessage(message, "*");
-        };
+        console.log("Page loaded. Injecting message listener...");
         
-        console.log("Wrapper ready, waiting for Photopea...");
-    </script>
-</body>
-</html>`;
-
-        // Load the wrapper page
-        await page.setContent(wrapperHTML);
-        console.log("Wrapper page loaded, waiting for Photopea iframe to initialize...");
+        // Inject our message capture system into the page
+        await page.evaluate(() => {
+            window.photopeaMessages = [];
+            window.photopeaReady = false;
+            
+            // Intercept postMessages from Photopea to itself
+            const originalPostMessage = window.postMessage;
+            window.postMessage = function(message, targetOrigin) {
+                console.log("Photopea message:", message);
+                window.photopeaMessages.push(message);
+                
+                if (message === "done") {
+                    window.photopeaReady = true;
+                }
+                
+                // Still call the original
+                return originalPostMessage.call(window, message, targetOrigin);
+            };
+            
+            console.log("Message listener injected");
+        });
         
-        // Wait for Photopea to send "done" message
+        console.log("Waiting for Photopea to initialize...");
+        
+        // Wait for Photopea to be ready
         await page.waitForFunction(
-            () => window.photopeaReady === true,
+            () => {
+                // Check if Photopea app exists AND is ready
+                return typeof app !== 'undefined' && 
+                       typeof app.activeDocument !== 'undefined' &&
+                       typeof app.open === 'function';
+            },
             { timeout: 120000, polling: 1000 }
         );
         
-        console.log("✓ Photopea iframe initialized and ready!");
+        console.log("✓ Photopea initialized!");
         
-        // Give it a moment to fully stabilize
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        // Extra stability delay
+        await new Promise(resolve => setTimeout(resolve, 3000));
 
         console.log("Starting PSD processing...");
 
-        // Execute the automation using postMessage API
+        // Process using direct app object (not postMessage since we're in same context)
         const result = await page.evaluate(async (psdUrl, mods) => {
             try {
-                console.log("=== Processing via postMessage API ===");
-                
-                // Helper to wait for "done" message
-                const waitForDone = () => {
-                    return new Promise((resolve) => {
-                        const initialLength = window.photopeaMessages.length;
-                        const checkDone = () => {
-                            const newMessages = window.photopeaMessages.slice(initialLength);
-                            if (newMessages.includes("done")) {
-                                resolve(newMessages);
-                            } else {
-                                setTimeout(checkDone, 100);
-                            }
-                        };
-                        checkDone();
-                    });
-                };
+                console.log("=== Processing PSD ===");
                 
                 // Fetch PSD
                 console.log("Fetching PSD...");
                 const psdResp = await fetch(psdUrl);
+                if (!psdResp.ok) throw new Error(`Failed to fetch PSD: ${psdResp.statusText}`);
                 const psdBuffer = await psdResp.arrayBuffer();
                 console.log(`✓ PSD fetched: ${psdBuffer.byteLength} bytes`);
                 
-                // Send PSD to Photopea
-                console.log("Sending PSD to Photopea...");
-                window.sendToPhotopea(psdBuffer);
-                await waitForDone();
-                console.log("✓ PSD opened in Photopea");
+                // Open PSD
+                console.log("Opening PSD in Photopea...");
+                await app.open(psdBuffer, "template.psd");
+                await new Promise(resolve => setTimeout(resolve, 3000));
                 
-                // Build the script to modify the PSD
-                let script = `
-                    var doc = app.activeDocument;
-                    console.log("Active document: " + doc.name);
-                    console.log("Layers: " + doc.layers.length);
-                    
-                    function findLayer(layers, name) {
-                        for (var i = 0; i < layers.length; i++) {
-                            if (layers[i].name === name) return layers[i];
-                            if (layers[i].layers) {
-                                var found = findLayer(layers[i].layers, name);
-                                if (found) return found;
-                            }
+                const doc = app.activeDocument;
+                if (!doc) throw new Error("No active document");
+                console.log(`✓ PSD opened. Layers: ${doc.layers.length}`);
+                
+                // Helper function to find layers
+                function findLayer(layers, name) {
+                    if (!layers) return null;
+                    for (let i = 0; i < layers.length; i++) {
+                        if (layers[i].name === name) {
+                            console.log(`✓ Found layer: ${name}`);
+                            return layers[i];
                         }
-                        return null;
+                        if (layers[i].layers) {
+                            const found = findLayer(layers[i].layers, name);
+                            if (found) return found;
+                        }
                     }
-                `;
-                
-                // Add modifications to script
-                for (const mod of mods) {
-                    console.log(`Adding modification for: ${mod.layerName}`);
-                    
-                    if (mod.text) {
-                        script += `
-                            var layer = findLayer(doc.layers, "${mod.layerName}");
-                            if (layer && layer.kind === "TEXT") {
-                                console.log("Updating text in ${mod.layerName}");
-                                layer.textItem.contents = "${mod.text}";
-                            } else {
-                                console.log("Text layer ${mod.layerName} not found");
-                            }
-                        `;
-                    }
-                    
-                    if (mod.image) {
-                        // For images, we need to load them first, then replace
-                        script += `
-                            var layer = findLayer(doc.layers, "${mod.layerName}");
-                            if (layer) {
-                                console.log("Will replace image in ${mod.layerName}");
-                                doc.activeLayer = layer;
-                                // Image will be loaded separately
-                            }
-                        `;
-                    }
+                    return null;
                 }
                 
-                // Execute the script
-                console.log("Executing modification script...");
-                window.sendToPhotopea(script);
-                await waitForDone();
-                console.log("✓ Modifications applied");
-                
-                // Handle image replacements
+                // Apply modifications
                 for (const mod of mods) {
+                    console.log(`Processing: ${mod.layerName}`);
+                    const layer = findLayer(doc.layers, mod.layerName);
+                    
+                    if (!layer) {
+                        console.warn(`⚠ Layer not found: ${mod.layerName}`);
+                        continue;
+                    }
+                    
+                    if (mod.text && layer.kind === "TEXT") {
+                        console.log(`Updating text to: "${mod.text}"`);
+                        layer.textItem.contents = mod.text;
+                        console.log("✓ Text updated");
+                    }
+                    
                     if (mod.image) {
-                        console.log(`Replacing image for ${mod.layerName}...`);
+                        console.log(`Replacing image from: ${mod.image}`);
+                        doc.activeLayer = layer;
+                        
+                        // Fetch and open replacement image
                         const imgResp = await fetch(mod.image);
+                        if (!imgResp.ok) throw new Error(`Failed to fetch image: ${imgResp.statusText}`);
                         const imgBuffer = await imgResp.arrayBuffer();
                         
-                        // Select the layer first
-                        const selectScript = `
-                            var layer = findLayer(doc.layers, "${mod.layerName}");
-                            if (layer) {
-                                doc.activeLayer = layer;
-                                console.log("Layer ${mod.layerName} selected");
-                            }
-                        `;
-                        window.sendToPhotopea(selectScript);
-                        await waitForDone();
-                        
-                        // Send the image
-                        window.sendToPhotopea(imgBuffer);
-                        await waitForDone();
-                        console.log(`✓ Image replaced for ${mod.layerName}`);
+                        await app.open(imgBuffer, "replacement.jpg", true);
+                        await new Promise(resolve => setTimeout(resolve, 1000));
+                        console.log("✓ Image replaced");
                     }
                 }
                 
-                // Export as JPG
+                // Export to JPG
                 console.log("Exporting to JPG...");
-                const exportScript = 'app.activeDocument.saveToOE("jpg");';
-                window.sendToPhotopea(exportScript);
+                const jpgBuffer = await doc.saveToOE("jpg");
+                console.log(`✓ JPG exported: ${jpgBuffer.byteLength} bytes`);
                 
-                // Wait for the JPG data (ArrayBuffer)
+                // Convert to base64 for transfer
+                const blob = new Blob([jpgBuffer]);
+                const reader = new FileReader();
+                
                 return new Promise((resolve) => {
-                    const initialLength = window.photopeaMessages.length;
-                    const checkForImage = () => {
-                        const newMessages = window.photopeaMessages.slice(initialLength);
-                        for (let msg of newMessages) {
-                            if (msg instanceof ArrayBuffer) {
-                                console.log(`✓ JPG received: ${msg.byteLength} bytes`);
-                                resolve({ success: true, imageBuffer: msg });
-                                return;
-                            }
-                        }
-                        setTimeout(checkForImage, 100);
+                    reader.onloadend = () => {
+                        const base64 = reader.result.split(',')[1];
+                        console.log("✓ Image converted to base64");
+                        resolve({ success: true, base64: base64 });
                     };
-                    setTimeout(checkForImage, 100);
+                    reader.readAsDataURL(blob);
                 });
                 
             } catch (error) {
-                console.error("Processing error:", error);
+                console.error("Processing error:", error.message);
                 return { success: false, error: error.message };
             }
         }, psdUrl, modifications);
@@ -264,8 +213,8 @@ app.post('/process-psd', async (req, res) => {
             throw new Error(`Processing failed: ${result.error}`);
         }
 
-        console.log("Converting image buffer...");
-        const imageBuffer = Buffer.from(result.imageBuffer);
+        console.log("Converting image...");
+        const imageBuffer = Buffer.from(result.base64, 'base64');
         console.log(`✓ Final image: ${imageBuffer.length} bytes`);
         
         console.log("Uploading to Google Drive...");
@@ -293,7 +242,7 @@ app.post('/process-psd', async (req, res) => {
             requestBody: { role: 'reader', type: 'anyone' },
         });
 
-        console.log(`✓ Success! File ID: ${file.data.id}`);
+        console.log(`✓ SUCCESS! File ID: ${file.data.id}`);
         
         res.json({ 
             success: true, 
@@ -333,5 +282,5 @@ app.post('/process-psd', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🚀 Photopea Worker running on port ${PORT}`);
-    console.log(`Using official Photopea iframe postMessage API`);
+    console.log(`Using direct Photopea API access`);
 });
