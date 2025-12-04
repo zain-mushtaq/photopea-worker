@@ -28,7 +28,6 @@ async function createBrowser() {
             '--disable-dev-shm-usage',
             '--disable-gpu',
             '--disable-software-rasterizer',
-            '--disable-dev-tools',
             '--no-first-run',
             '--disable-background-networking',
             '--disable-default-apps',
@@ -42,7 +41,6 @@ async function createBrowser() {
             '--disable-features=IsolateOrigins,site-per-process',
             '--disable-blink-features=AutomationControlled',
             '--window-size=1920,1080',
-            // Railway-specific flags
             '--disable-crash-reporter',
             '--disable-in-process-stack-traces',
             '--disable-logging',
@@ -51,7 +49,9 @@ async function createBrowser() {
             '--user-data-dir=/tmp/chrome-user-data',
             '--data-path=/tmp/chrome-data',
             '--homedir=/tmp',
-            '--disk-cache-dir=/tmp/cache'
+            '--disk-cache-dir=/tmp/cache',
+            // CRITICAL: Enable JavaScript
+            '--enable-javascript'
         ],
         timeout: 60000
     });
@@ -79,34 +79,78 @@ app.post('/process-psd', async (req, res) => {
     let page;
 
     try {
-        // Create fresh browser for THIS request only
         browser = await createBrowser();
         page = await browser.newPage();
         
-        // Set longer timeouts
-        page.setDefaultTimeout(120000);
+        // Longer timeouts
+        page.setDefaultTimeout(180000); // 3 minutes
+        
+        // Make browser appear less bot-like
+        await page.evaluateOnNewDocument(() => {
+            // Override navigator properties
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => false,
+            });
+            
+            // Add chrome object
+            window.chrome = {
+                runtime: {},
+            };
+            
+            // Override permissions
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications' ?
+                    Promise.resolve({ state: Notification.permission }) :
+                    originalQuery(parameters)
+            );
+        });
 
-        // Console logging
-        page.on('console', msg => console.log('BROWSER:', msg.text()));
-        page.on('pageerror', err => console.log('PAGE ERROR:', err.toString()));
+        // Enhanced console logging
+        page.on('console', msg => {
+            const type = msg.type();
+            const text = msg.text();
+            console.log(`BROWSER [${type}]:`, text);
+        });
+        page.on('pageerror', err => console.error('PAGE ERROR:', err.toString()));
+        page.on('requestfailed', req => console.log('REQUEST FAILED:', req.url()));
 
         console.log("Navigating to Photopea...");
         
         await page.goto('https://www.photopea.com/', { 
-            waitUntil: 'networkidle2',
+            waitUntil: 'domcontentloaded',
             timeout: 120000 
         });
 
-        console.log("Waiting for Photopea to initialize...");
-
-        // Wait for app object
+        console.log("Page loaded, waiting for Photopea to initialize...");
+        
+        // IMPROVED: Check multiple conditions for Photopea readiness
         await page.waitForFunction(
-            () => typeof window.app !== 'undefined',
-            { timeout: 90000 }
+            () => {
+                // Check if window.app exists and has required methods
+                if (typeof window.app === 'undefined') {
+                    console.log('Waiting: window.app is undefined');
+                    return false;
+                }
+                
+                if (typeof window.app.open !== 'function') {
+                    console.log('Waiting: window.app.open is not a function');
+                    return false;
+                }
+                
+                console.log('Success: Photopea is ready!');
+                return true;
+            },
+            { 
+                timeout: 150000, // 2.5 minutes
+                polling: 1000 // Check every second
+            }
         );
         
-        console.log("Photopea Ready!");
-        await page.waitForTimeout(2000);
+        console.log("✓ Photopea fully initialized!");
+        
+        // Additional wait for stability
+        await page.waitForTimeout(3000);
 
         // Setup data transfer
         let finalImageBuffer = null;
@@ -114,86 +158,118 @@ app.post('/process-psd', async (req, res) => {
             finalImageBuffer = Buffer.from(base64Data.replace(/^data:image\/\w+;base64,/, ""), 'base64');
         });
 
-        // Execute automation
-        await page.evaluate(async (url, mods) => {
-            console.log("Starting PSD processing...");
-            
-            async function loadBinary(url) {
-                const resp = await fetch(url);
-                if (!resp.ok) throw new Error("Fetch failed: " + resp.statusText);
-                return await resp.arrayBuffer();
-            }
-            
-            console.log("Downloading PSD...");
-            const psdBuffer = await loadBinary(url);
-            
-            console.log("Opening PSD...");
-            await window.app.open(psdBuffer, "template.psd");
-            await new Promise(resolve => setTimeout(resolve, 2000));
-            
-            const doc = window.app.activeDocument;
-            if (!doc) throw new Error("No active document found");
+        console.log("Starting PSD processing in browser...");
 
-            console.log("PSD Opened. Layers:", doc.layers.length);
-
-            function findLayer(layers, targetName) {
-                if (!layers) return null;
-                for (let i = 0; i < layers.length; i++) {
-                    if (layers[i].name === targetName) return layers[i];
-                    if (layers[i].layers) {
-                        const found = findLayer(layers[i].layers, targetName);
-                        if (found) return found;
-                    }
-                }
-                return null;
-            }
-
-            // Apply modifications
-            for (const mod of mods) {
-                console.log("Processing layer:", mod.layerName);
-                const layer = findLayer(doc.layers, mod.layerName);
+        // Execute automation with better error handling
+        const result = await page.evaluate(async (url, mods) => {
+            try {
+                console.log("=== Browser-side processing started ===");
                 
-                if (layer) {
-                    if (mod.text && layer.kind === "TEXT") {
-                        console.log("Updating text...");
-                        layer.textItem.contents = mod.text;
-                    } else if (mod.image) {
-                        console.log("Replacing image...");
-                        doc.activeLayer = layer;
-                        const imgBuffer = await loadBinary(mod.image);
-                        await window.app.open(imgBuffer, "replacement.jpg", true);
-                    }
-                } else {
-                    console.warn("Layer not found:", mod.layerName);
+                async function loadBinary(url) {
+                    console.log(`Fetching: ${url}`);
+                    const resp = await fetch(url);
+                    if (!resp.ok) throw new Error(`Fetch failed: ${resp.statusText}`);
+                    const buffer = await resp.arrayBuffer();
+                    console.log(`✓ Fetched ${buffer.byteLength} bytes`);
+                    return buffer;
                 }
+                
+                console.log("Downloading PSD...");
+                const psdBuffer = await loadBinary(url);
+                
+                console.log("Opening PSD in Photopea...");
+                await window.app.open(psdBuffer, "template.psd");
+                await new Promise(resolve => setTimeout(resolve, 3000));
+                
+                const doc = window.app.activeDocument;
+                if (!doc) throw new Error("No active document found after opening PSD");
+
+                console.log(`✓ PSD opened. Layers: ${doc.layers.length}`);
+
+                function findLayer(layers, targetName) {
+                    if (!layers) return null;
+                    for (let i = 0; i < layers.length; i++) {
+                        if (layers[i].name === targetName) {
+                            console.log(`✓ Found layer: ${targetName}`);
+                            return layers[i];
+                        }
+                        if (layers[i].layers) {
+                            const found = findLayer(layers[i].layers, targetName);
+                            if (found) return found;
+                        }
+                    }
+                    return null;
+                }
+
+                // Apply modifications
+                for (const mod of mods) {
+                    console.log(`Processing modification for layer: ${mod.layerName}`);
+                    const layer = findLayer(doc.layers, mod.layerName);
+                    
+                    if (layer) {
+                        if (mod.text && layer.kind === "TEXT") {
+                            console.log(`Updating text to: "${mod.text}"`);
+                            layer.textItem.contents = mod.text;
+                            console.log("✓ Text updated");
+                        } else if (mod.image) {
+                            console.log(`Replacing image from: ${mod.image}`);
+                            doc.activeLayer = layer;
+                            const imgBuffer = await loadBinary(mod.image);
+                            await window.app.open(imgBuffer, "replacement.jpg", true);
+                            console.log("✓ Image replaced");
+                        }
+                    } else {
+                        console.warn(`⚠ Layer not found: ${mod.layerName}`);
+                    }
+                }
+                
+                console.log("Exporting to JPG...");
+                const jpgBuffer = await doc.saveToOE("jpg");
+                console.log(`✓ JPG exported: ${jpgBuffer.byteLength} bytes`);
+                
+                const blob = new Blob([jpgBuffer]);
+                const reader = new FileReader();
+                return new Promise((resolve) => {
+                    reader.onloadend = () => {
+                        window.sendImageToNode(reader.result);
+                        console.log("✓ Image sent to Node.js");
+                        resolve({ success: true });
+                    };
+                    reader.readAsDataURL(blob);
+                });
+            } catch (error) {
+                console.error("Browser-side error:", error.message);
+                return { success: false, error: error.message };
             }
-            
-            console.log("Exporting JPG...");
-            const jpgBuffer = await doc.saveToOE("jpg");
-            
-            const blob = new Blob([jpgBuffer]);
-            const reader = new FileReader();
-            return new Promise((resolve) => {
-                reader.onloadend = () => {
-                    window.sendImageToNode(reader.result);
-                    resolve();
-                };
-                reader.readAsDataURL(blob);
-            });
         }, psdUrl, modifications);
 
-        // Wait for result
-        console.log("Waiting for render...");
+        if (!result.success) {
+            throw new Error(`Browser processing failed: ${result.error}`);
+        }
+
+        // Wait for result with progress logging
+        console.log("Waiting for image data...");
         const startWait = Date.now();
+        let lastLog = startWait;
+        
         while (!finalImageBuffer) {
-            if (Date.now() - startWait > 120000) {
-                throw new Error("Timeout waiting for image");
+            const elapsed = Date.now() - startWait;
+            
+            if (elapsed > 180000) { // 3 minutes
+                throw new Error("Timeout waiting for image (180s)");
             }
+            
+            // Log progress every 10 seconds
+            if (Date.now() - lastLog > 10000) {
+                console.log(`Still waiting... (${Math.floor(elapsed/1000)}s elapsed)`);
+                lastLog = Date.now();
+            }
+            
             await new Promise(r => setTimeout(r, 1000));
         }
 
-        console.log("Image rendered:", finalImageBuffer.length, "bytes");
-        console.log("Uploading to Drive...");
+        console.log(`✓ Image received: ${finalImageBuffer.length} bytes`);
+        console.log("Uploading to Google Drive...");
 
         const bufferStream = new stream.PassThrough();
         bufferStream.end(finalImageBuffer);
@@ -219,7 +295,7 @@ app.post('/process-psd', async (req, res) => {
             requestBody: { role: 'reader', type: 'anyone' },
         });
 
-        console.log("Success! File ID:", file.data.id);
+        console.log(`✓ Upload complete! File ID: ${file.data.id}`);
         
         res.json({ 
             success: true, 
@@ -229,7 +305,7 @@ app.post('/process-psd', async (req, res) => {
         });
 
     } catch (error) {
-        console.error("ERROR:", error.message);
+        console.error("❌ ERROR:", error.message);
         console.error(error.stack);
         res.status(500).json({ 
             success: false, 
@@ -237,7 +313,6 @@ app.post('/process-psd', async (req, res) => {
             stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
         });
     } finally {
-        // ALWAYS close page and browser after each request
         if (page) {
             try { 
                 await page.close(); 
@@ -260,7 +335,7 @@ app.post('/process-psd', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`Photopea Worker running on port ${PORT}`);
+    console.log(`🚀 Photopea Worker running on port ${PORT}`);
     console.log(`Browser will be created fresh for each request`);
     console.log(`Environment: ${process.env.NODE_ENV || 'production'}`);
 });
