@@ -26,7 +26,6 @@ async function createBrowser() {
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
-            '--disable-gpu',
             '--disable-software-rasterizer',
             '--no-first-run',
             '--disable-background-networking',
@@ -34,25 +33,23 @@ async function createBrowser() {
             '--disable-extensions',
             '--disable-sync',
             '--disable-translate',
-            '--metrics-recording-only',
             '--mute-audio',
             '--no-default-browser-check',
-            '--safebrowsing-disable-auto-update',
             '--disable-features=IsolateOrigins,site-per-process',
             '--disable-blink-features=AutomationControlled',
             '--window-size=1920,1080',
-            '--disable-crash-reporter',
-            '--disable-in-process-stack-traces',
-            '--disable-logging',
-            '--disable-breakpad',
-            '--log-level=3',
             '--user-data-dir=/tmp/chrome-user-data',
             '--data-path=/tmp/chrome-data',
-            '--homedir=/tmp',
             '--disk-cache-dir=/tmp/cache',
-            // CRITICAL: Enable JavaScript
-            '--enable-javascript'
+            // CRITICAL: Explicitly enable WebAssembly and JavaScript
+            '--enable-javascript',
+            '--js-flags=--expose-gc',
+            '--enable-webgl',
+            // Memory settings for WASM
+            '--disable-gpu-sandbox',
+            '--enable-unsafe-webgpu'
         ],
+        ignoreDefaultArgs: ['--disable-extensions'],
         timeout: 60000
     });
     
@@ -82,75 +79,121 @@ app.post('/process-psd', async (req, res) => {
         browser = await createBrowser();
         page = await browser.newPage();
         
-        // Longer timeouts
-        page.setDefaultTimeout(180000); // 3 minutes
+        page.setDefaultTimeout(180000);
         
-        // Make browser appear less bot-like
+        // Enhanced anti-detection
         await page.evaluateOnNewDocument(() => {
-            // Override navigator properties
             Object.defineProperty(navigator, 'webdriver', {
                 get: () => false,
             });
             
-            // Add chrome object
             window.chrome = {
                 runtime: {},
             };
             
-            // Override permissions
-            const originalQuery = window.navigator.permissions.query;
-            window.navigator.permissions.query = (parameters) => (
-                parameters.name === 'notifications' ?
-                    Promise.resolve({ state: Notification.permission }) :
-                    originalQuery(parameters)
-            );
+            // Ensure WebAssembly is available
+            if (typeof WebAssembly === 'undefined') {
+                console.error('CRITICAL: WebAssembly is not available!');
+            } else {
+                console.log('✓ WebAssembly is available');
+            }
         });
 
-        // Enhanced console logging
+        // Console logging
         page.on('console', msg => {
             const type = msg.type();
             const text = msg.text();
             console.log(`BROWSER [${type}]:`, text);
         });
         page.on('pageerror', err => console.error('PAGE ERROR:', err.toString()));
-        page.on('requestfailed', req => console.log('REQUEST FAILED:', req.url()));
+        page.on('requestfailed', req => {
+            console.log('REQUEST FAILED:', req.url(), req.failure()?.errorText);
+        });
 
         console.log("Navigating to Photopea...");
         
-        await page.goto('https://www.photopea.com/', { 
-            waitUntil: 'domcontentloaded',
+        const response = await page.goto('https://www.photopea.com/', { 
+            waitUntil: 'networkidle0', // Wait for all network activity to stop
             timeout: 120000 
         });
-
-        console.log("Page loaded, waiting for Photopea to initialize...");
         
-        // IMPROVED: Check multiple conditions for Photopea readiness
-        await page.waitForFunction(
-            () => {
-                // Check if window.app exists and has required methods
-                if (typeof window.app === 'undefined') {
-                    console.log('Waiting: window.app is undefined');
-                    return false;
+        console.log(`Page loaded with status: ${response.status()}`);
+
+        // DEBUG: Check WebAssembly and window.app availability
+        const debugInfo = await page.evaluate(() => {
+            return {
+                hasWebAssembly: typeof WebAssembly !== 'undefined',
+                canInstantiate: typeof WebAssembly?.instantiate === 'function',
+                hasApp: typeof window.app !== 'undefined',
+                appKeys: window.app ? Object.keys(window.app) : [],
+                userAgent: navigator.userAgent,
+                windowKeys: Object.keys(window).filter(k => k.includes('app') || k.includes('photo'))
+            };
+        });
+        
+        console.log("=== DEBUG INFO ===");
+        console.log(JSON.stringify(debugInfo, null, 2));
+        console.log("==================");
+
+        if (!debugInfo.hasWebAssembly) {
+            throw new Error("WebAssembly is NOT available in the browser context!");
+        }
+
+        console.log("Waiting for Photopea to initialize (checking window.app)...");
+        
+        // Try different approach: wait for any Photopea indication
+        let attempts = 0;
+        const maxAttempts = 60; // 60 seconds
+        
+        while (attempts < maxAttempts) {
+            const status = await page.evaluate(() => {
+                // Check multiple possible states
+                if (typeof window.app !== 'undefined' && typeof window.app.open === 'function') {
+                    return { ready: true, message: 'window.app.open found' };
                 }
                 
-                if (typeof window.app.open !== 'function') {
-                    console.log('Waiting: window.app.open is not a function');
-                    return false;
+                // Check if Photopea loaded but under different name
+                const photopeaScript = document.querySelector('script[src*="photopea"]');
+                if (photopeaScript) {
+                    return { ready: false, message: 'Photopea script found, still loading' };
                 }
                 
-                console.log('Success: Photopea is ready!');
-                return true;
-            },
-            { 
-                timeout: 150000, // 2.5 minutes
-                polling: 1000 // Check every second
+                // Check for any errors in the page
+                const errors = window.__photopeaErrors || [];
+                if (errors.length > 0) {
+                    return { ready: false, message: `Errors: ${errors.join(', ')}` };
+                }
+                
+                return { ready: false, message: 'Still waiting for window.app' };
+            });
+            
+            if (status.ready) {
+                console.log(`✓ ${status.message}`);
+                break;
             }
-        );
+            
+            if (attempts % 10 === 0) {
+                console.log(`[${attempts}s] ${status.message}`);
+            }
+            
+            attempts++;
+            await page.waitForTimeout(1000);
+        }
+        
+        if (attempts >= maxAttempts) {
+            // Take a screenshot for debugging
+            const screenshot = await page.screenshot({ encoding: 'base64' });
+            console.log("Photopea failed to load. Screenshot captured (first 100 chars):", screenshot.substring(0, 100));
+            
+            // Get page content
+            const htmlContent = await page.content();
+            console.log("Page HTML (first 500 chars):", htmlContent.substring(0, 500));
+            
+            throw new Error("Photopea did not initialize after 60 seconds");
+        }
         
         console.log("✓ Photopea fully initialized!");
-        
-        // Additional wait for stability
-        await page.waitForTimeout(3000);
+        await page.waitForTimeout(2000);
 
         // Setup data transfer
         let finalImageBuffer = null;
@@ -160,7 +203,6 @@ app.post('/process-psd', async (req, res) => {
 
         console.log("Starting PSD processing in browser...");
 
-        // Execute automation with better error handling
         const result = await page.evaluate(async (url, mods) => {
             try {
                 console.log("=== Browser-side processing started ===");
@@ -201,7 +243,6 @@ app.post('/process-psd', async (req, res) => {
                     return null;
                 }
 
-                // Apply modifications
                 for (const mod of mods) {
                     console.log(`Processing modification for layer: ${mod.layerName}`);
                     const layer = findLayer(doc.layers, mod.layerName);
@@ -247,25 +288,15 @@ app.post('/process-psd', async (req, res) => {
             throw new Error(`Browser processing failed: ${result.error}`);
         }
 
-        // Wait for result with progress logging
         console.log("Waiting for image data...");
         const startWait = Date.now();
-        let lastLog = startWait;
         
-        while (!finalImageBuffer) {
-            const elapsed = Date.now() - startWait;
-            
-            if (elapsed > 180000) { // 3 minutes
-                throw new Error("Timeout waiting for image (180s)");
-            }
-            
-            // Log progress every 10 seconds
-            if (Date.now() - lastLog > 10000) {
-                console.log(`Still waiting... (${Math.floor(elapsed/1000)}s elapsed)`);
-                lastLog = Date.now();
-            }
-            
+        while (!finalImageBuffer && (Date.now() - startWait) < 180000) {
             await new Promise(r => setTimeout(r, 1000));
+        }
+
+        if (!finalImageBuffer) {
+            throw new Error("Timeout waiting for image (180s)");
         }
 
         console.log(`✓ Image received: ${finalImageBuffer.length} bytes`);
